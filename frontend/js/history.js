@@ -1,7 +1,9 @@
-/* History: browse scenes / runs / experiments with cross-page links. */
+/* History: browse scenes / runs / experiments with live list updates. */
 
 let hist = { scenes: [], runs: [], experiments: [] };
 let tab = "scenes";
+let stream = null;
+let refreshQueued = false;
 
 function renderScenes() {
   return hist.scenes.map((s) => `
@@ -65,6 +67,21 @@ async function load() {
   render();
 }
 
+function queueRefresh() {
+  if (refreshQueued) return;
+  refreshQueued = true;
+  requestAnimationFrame(() => {
+    refreshQueued = false;
+    load();
+  });
+}
+
+function subscribe() {
+  stream = new EventStream(
+    ["runs:status", "runs:created", "runs:deleted", "experiments:status"],
+    { resync: load, message: queueRefresh });
+}
+
 function init() {
   document.querySelectorAll(".tab").forEach((t) => {
     t.onclick = () => {
@@ -73,7 +90,8 @@ function init() {
       render();
     };
   });
-  load().catch((e) => console.error(e));
+  window.addEventListener("beforeunload", () => stream && stream.close());
+  load().then(subscribe).catch((e) => console.error(e));
 }
 
 init();

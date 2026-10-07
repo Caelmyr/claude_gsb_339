@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend import models, report, storage  # noqa: E402
 from backend.engine import make_engine  # noqa: E402
+from backend.events import decode_cursor, encode_cursor  # noqa: E402
 from backend.run_manager import manager  # noqa: E402
 
 _ENGINES = ["traffic/ca", "traffic/abm", "ecology/ca", "ecology/abm",
@@ -98,10 +99,25 @@ def run_lifecycle() -> None:
         manager.delete_run(rid)
 
 
+def event_replay_cursor() -> None:
+    topic = "run:smoke:progress"
+    from backend.events import broker
+    broker.reset_topics([topic])
+    broker.publish(topic, "run.progress", {"step": 1})
+    broker.publish(topic, "run.progress", {"step": 2})
+    _, replay, needs_resync = broker.subscribe_multi([topic], {})
+    assert needs_resync and not replay
+    cursor = decode_cursor(encode_cursor({topic: 1}))
+    _, replay, needs_resync = broker.subscribe_multi([topic], cursor)
+    assert not needs_resync
+    assert [e["data"]["step"] for _, e in replay] == [2]
+
+
 def main() -> None:
     check("six engines step and snapshot", engines_step)
     check("interventions apply", interventions_apply)
     check("atomic sharded storage", storage_atomic_roundtrip)
+    check("event replay cursor", event_replay_cursor)
     check("run lifecycle + report", run_lifecycle)
     print("\nall smoke tests passed")
 

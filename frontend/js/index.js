@@ -1,4 +1,4 @@
-/* Landing hub: KPIs, quick start, feature cards. */
+/* Landing hub: KPIs, quick start, live global status. */
 
 const CARDS = [
   { file: "config.html", icon: "🗺", title: "场景配置", desc: "选择领域与模型，配置地图与参数，安排定时干预措施。" },
@@ -13,23 +13,37 @@ const CARDS = [
   { file: "history.html", icon: "🗂", title: "历史场景", desc: "浏览历史场景、运行与实验，一键重新打开或回放。" },
 ];
 
-async function load() {
-  const hist = await get("/api/history");
+let globalStream = null;
+
+function renderStats(hist) {
   const finished = hist.runs.filter((r) => r.status === "finished").length;
   el("stats").innerHTML = `
     <div class="stat"><div class="k">场景</div><div class="v">${hist.scenes.length}</div><div class="d">已保存的场景定义</div></div>
     <div class="stat"><div class="k">运行</div><div class="v">${hist.runs.length}</div><div class="d">历史运行总数</div></div>
     <div class="stat"><div class="k">已完成</div><div class="v">${finished}</div><div class="d">批量运行至完成</div></div>
     <div class="stat"><div class="k">对比实验</div><div class="v">${hist.experiments.length}</div><div class="d">多组参数实验</div></div>`;
+}
 
+function renderCards() {
   el("cards").innerHTML = CARDS.map((c) => `
     <a class="card" href="/${c.file}" style="display:block;text-decoration:none;color:var(--text)">
       <div style="font-size:22px">${c.icon}</div>
       <h2 style="margin:8px 0 6px">${c.title}</h2>
       <p class="muted small" style="margin:0">${c.desc}</p>
     </a>`).join("");
+}
 
+async function load() {
+  const hist = await get("/api/history");
+  renderStats(hist);
+  renderCards();
   await fillSceneSelect(el("quickScene"));
+}
+
+function subscribeGlobal() {
+  globalStream = new EventStream(
+    ["runs:status", "runs:created", "runs:deleted", "experiments:status"],
+    { resync: load, message: () => load() });
 }
 
 el("quickGo").addEventListener("click", async () => {
@@ -41,4 +55,6 @@ el("quickGo").addEventListener("click", async () => {
   } catch (e) { alert("创建运行失败：" + e.message); }
 });
 
-load().catch((e) => showNotice(el("stats"), "加载失败：" + e.message, "error"));
+window.addEventListener("beforeunload", () => globalStream && globalStream.close());
+
+load().then(subscribeGlobal).catch((e) => showNotice(el("stats"), "加载失败：" + e.message, "error"));

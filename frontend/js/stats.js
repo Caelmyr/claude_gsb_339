@@ -1,9 +1,13 @@
-/* Statistics charts: ECharts line chart of per-step aggregate metrics. */
+/* Statistics charts: streamed compact series rows replace polling. */
 
 let chart = null;
 let series = [];
 let labels = {};
 let selected = new Set();
+let runId = null;
+let stream = null;
+let renderQueued = false;
+let lastStep = -1;
 
 async function init() {
   const { domains } = await get("/api/catalog");
@@ -12,6 +16,7 @@ async function init() {
   }
   el("loadBtn").onclick = load;
   el("runSelect").onchange = load;
+  window.addEventListener("beforeunload", () => stream && stream.close());
   await fillRunSelect(el("runSelect"));
   const q = new URLSearchParams(window.location.search).get("run");
   if (q && el("runSelect").querySelector(`option[value="${q}"]`)) {
@@ -20,23 +25,59 @@ async function init() {
   } else if (el("runSelect").options.length > 1) { el("runSelect").selectedIndex = 1; await load(); }
 }
 
-async function load() {
-  const runId = el("runSelect").value;
-  if (!runId) return;
+async function resyncRun() {
   const { series: s } = await get(`/api/runs/${runId}/series`);
   series = s;
+  lastStep = series.length ? series[series.length - 1].step : -1;
+  rebuildMetricKeys(true);
+  queueRender();
+}
 
-  // Metric keys from the first row (minus step).
+async function subscribe() {
+  if (stream) stream.close();
+  stream = subscribeRun(runId, ["status", "progress"], {
+    resync: resyncRun,
+    "run.status": (m) => {
+      if (m.status === "finished" || m.status === "stopped" || m.status === "error") resyncRun();
+    },
+    "run.progress": mergeProgress,
+  });
+}
+
+async function load() {
+  runId = el("runSelect").value;
+  if (!runId) return;
+  await resyncRun();
+  await subscribe();
+}
+
+function rebuildMetricKeys(resetChecks) {
   const keys = series.length ? Object.keys(series[series.length - 1]).filter((k) => k !== "step") : [];
-  selected = new Set(keys);
+  if (resetChecks) selected = new Set(keys);
 
   el("metricChecks").innerHTML = keys.map((k) => `
-    <label class="check"><input type="checkbox" class="mchk" value="${esc(k)}" checked> ${esc(labels[k] || k)}</label>`).join("");
+    <label class="check"><input type="checkbox" class="mchk" value="${esc(k)}" ${selected.has(k) ? "checked" : ""}> ${esc(labels[k] || k)}</label>`).join("");
   el("metricChecks").querySelectorAll(".mchk").forEach((c) => {
     c.onchange = () => { c.checked ? selected.add(c.value) : selected.delete(c.value); render(); };
   });
+}
 
-  render();
+function mergeProgress(p) {
+  const byStep = new Map(series.map((r) => [r.step, r]));
+  (p.rows || [])
+    .filter((r) => r.step > lastStep)
+    .forEach((r) => { byStep.set(r.step, r); lastStep = Math.max(lastStep, r.step); });
+  series = [...byStep.values()].sort((a, b) => a.step - b.step);
+  const oldKeys = [...selected];
+  rebuildMetricKeys(false);
+  oldKeys.forEach((k) => selected.add(k));
+  queueRender();
+}
+
+function queueRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(); });
 }
 
 function render() {

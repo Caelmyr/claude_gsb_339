@@ -71,6 +71,9 @@ class Experiment:
     run_ids: List[str] = field(default_factory=list)
     status: str = "pending"           # pending | running | finished | error
     error: str = ""
+    completed_runs: int = 0
+    current_run_id: str = ""
+    status_revision: int = 0
     created_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -83,6 +86,9 @@ class Experiment:
             "run_ids": self.run_ids,
             "status": self.status,
             "error": self.error,
+            "completed_runs": self.completed_runs,
+            "current_run_id": self.current_run_id,
+            "status_revision": self.status_revision,
             "created_at": self.created_at,
         }
 
@@ -97,6 +103,9 @@ class Experiment:
             run_ids=list(data.get("run_ids") or []),
             status=str(data.get("status", "pending")),
             error=str(data.get("error", "")),
+            completed_runs=int(data.get("completed_runs", 0)),
+            current_run_id=str(data.get("current_run_id", "")),
+            status_revision=int(data.get("status_revision", 0)),
             created_at=str(data.get("created_at", "")),
         )
         if not exp.id:

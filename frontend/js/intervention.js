@@ -1,8 +1,10 @@
-/* Interventions: apply policy/drug/cull actions to a running scene + log. */
+/* Interventions: apply policy/drug/cull actions and subscribe to the log. */
 
 let CATALOG = null;
 let runId = null;
 let runMeta = null;
+let stream = null;
+let eventSeqs = new Set();
 
 function paramField(p) {
   if (p.type === "bool") {
@@ -39,7 +41,7 @@ function renderForms() {
       try {
         const res = await post(`/api/runs/${runId}/interventions`, { type: card.dataset.type, params });
         alert(res.applied ? ("已施加：" + res.reason) : ("未施加：" + res.reason));
-        await loadAll();
+        renderScheduled();
       } catch (e) { alert("施加失败：" + e.message); }
     };
   });
@@ -54,33 +56,67 @@ function renderScheduled() {
     </div>`).join("") || '<p class="muted small">该场景没有定时干预。</p>';
 }
 
-async function loadEvents() {
-  const { events } = await get(`/api/runs/${runId}/events`);
-  el("events").innerHTML = `<thead><tr><th>步</th><th>类型</th><th>来源</th><th>结果</th></tr></thead><tbody>` +
-    events.slice().reverse().map((e) => `
-      <tr><td>${e.step}</td><td>${esc(e.type)}</td>
+function eventRow(e) {
+  return `<tr><td>${e.step}</td><td>${esc(e.type)}</td>
       <td>${e.scheduled ? '<span class="badge">定时</span>' : '<span class="badge ready">手动</span>'}</td>
-      <td class="muted small">${esc((e.result && e.result.reason) || "")}</td></tr>`).join("") + "</tbody>";
+      <td class="muted small">${esc((e.result && e.result.reason) || "")}</td></tr>`;
 }
 
-async function loadAll() {
-  runMeta = await get(`/api/runs/${runId}`);
+function renderEvents(events) {
+  eventSeqs = new Set(events.map((e) => e.seq));
+  el("events").innerHTML = `<thead><tr><th>步</th><th>类型</th><th>来源</th><th>结果</th></tr></thead><tbody>` +
+    events.slice().reverse().map(eventRow).join("") + "</tbody>";
+}
+
+function appendEvent(event) {
+  if (!event || eventSeqs.has(event.seq)) return;
+  eventSeqs.add(event.seq);
+  const body = el("events").querySelector("tbody");
+  if (body) body.insertAdjacentHTML("afterbegin", eventRow(event));
+}
+
+function updateInfo() {
   el("runInfo").textContent = `${runMeta.name} · ${DOMAIN_LABEL[runMeta.domain]} · ${MODEL_LABEL[runMeta.model]} · 第 ${runMeta.current_step} 步 · ${runMeta.status}`;
+}
+
+async function resyncRun() {
+  runMeta = await get(`/api/runs/${runId}`);
+  updateInfo();
   renderForms();
   renderScheduled();
-  await loadEvents();
+  const { events } = await get(`/api/runs/${runId}/events`);
+  renderEvents(events);
+}
+
+async function subscribe(id) {
+  if (stream) stream.close();
+  stream = subscribeRun(id, ["status", "events"], {
+    resync: resyncRun,
+    "run.status": (m) => {
+      if (runMeta && (m.status_revision || 0) < (runMeta.status_revision || 0)) return;
+      runMeta = { ...(runMeta || {}), ...m }; updateInfo(); renderScheduled();
+    },
+    "run.event": appendEvent,
+  });
+}
+
+async function loadAll(id = runId) {
+  runId = id;
+  await resyncRun();
+  await subscribe(runId);
 }
 
 async function init() {
   const { domains } = await get("/api/catalog");
   CATALOG = domains;
-  el("runSelect").onchange = (e) => { if (e.target.value) { runId = e.target.value; loadAll(); } };
+  el("runSelect").onchange = (e) => { if (e.target.value) loadAll(e.target.value); };
   el("refreshBtn").onclick = async () => { await fillRunSelect(el("runSelect")); };
+  window.addEventListener("beforeunload", () => stream && stream.close());
   await fillRunSelect(el("runSelect"));
   if (el("runSelect").options.length > 1) {
     el("runSelect").selectedIndex = 1;
     runId = el("runSelect").value;
-    await loadAll();
+    await loadAll(runId);
   }
 }
 

@@ -1,8 +1,9 @@
-/* Comparison experiments: create param groups, run in background, overlay. */
+/* Comparison experiments: create param groups, stream run/experiment updates. */
 
 let chart = null;
 let currentExp = null;
 let labels = {};
+let expStream = null;
 
 function addGroupRow(name = "", cfg = "{}") {
   const div = document.createElement("div");
@@ -33,7 +34,7 @@ async function refreshList() {
     </div>`).join("") || '<p class="muted small">暂无实验。</p>';
 
   el("expList").querySelectorAll(".list-item").forEach((li) => {
-    li.onclick = (ev) => { if (ev.target.closest(".xdel")) return; selectExp(li.dataset.id); };
+    li.onclick = (ev) => { if (!ev.target.closest(".xdel")) selectExp(li.dataset.id); };
   });
   el("expList").querySelectorAll(".xdel").forEach((b) => {
     b.onclick = async () => {
@@ -44,11 +45,46 @@ async function refreshList() {
   });
 }
 
-async function selectExp(id) {
+async function resyncExperiment(id = currentExp && currentExp.id) {
+  if (!id) return;
   currentExp = await get(`/api/experiments/${id}`);
+  updateExperimentView();
+}
+
+function subscribeExperiment(id) {
+  if (expStream) expStream.close();
+  expStream = new EventStream([`exp:${id}:stream`], {
+    resync: () => resyncExperiment(id),
+    "experiment.status": async (e) => {
+      if (!currentExp || currentExp.id !== id) currentExp = e;
+      else currentExp = { ...currentExp, ...e };
+      await refreshList();
+      updateExperimentView();
+      if (e.status === "finished") await resyncExperiment(id);
+      if (e.status === "error") el("expStatus").textContent = "出错：" + e.error;
+    },
+    "run.status": (r) => {
+      if (r.status === "running") {
+        el("expStatus").textContent = `第 ${(r.current_step || 0) + 1} 组运行中…`;
+      }
+    },
+    "run.progress": (p) => {
+      const done = currentExp ? (currentExp.completed_runs || 0) : 0;
+      el("expStatus").textContent =
+        `第 ${done + 1} 组运行中：第 ${p.step} 步`;
+    },
+  });
+}
+
+function updateExperimentView() {
+  if (!currentExp) return;
   if (currentExp.status !== "finished") {
     el("chartCard").style.display = "none";
-    setTimeout(() => selectExp(id), 800);
+    const total = currentExp.groups ? currentExp.groups.length : 0;
+    if (currentExp.status === "running" && total) {
+      el("expStatus").textContent =
+        `已完成 ${currentExp.completed_runs || 0}/${total} 组，后台持续推送…`;
+    }
     return;
   }
   el("chartCard").style.display = "block";
@@ -58,6 +94,11 @@ async function selectExp(id) {
     r.series.length ? Object.keys(r.series[0]).filter((k) => k !== "step") : []))];
   el("metricSel").innerHTML = keys.map((k) => `<option value="${esc(k)}">${esc(labels[k] || k)}</option>`).join("");
   renderChart();
+}
+
+async function selectExp(id) {
+  await resyncExperiment(id);
+  subscribeExperiment(id);
 }
 
 function renderChart() {
@@ -101,12 +142,10 @@ async function createExp() {
   stat.textContent = "正在运行…";
   try {
     const exp = await post("/api/experiments", { name, scene_id, steps, groups });
-    stat.textContent = "已提交，正在后台运行各组…";
-    const poll = setInterval(async () => {
-      const e = await get(`/api/experiments/${exp.id}`);
-      if (e.status === "finished") { clearInterval(poll); stat.textContent = "完成 ✓"; await refreshList(); selectExp(exp.id); }
-      else if (e.status === "error") { clearInterval(poll); stat.textContent = "出错：" + e.error; }
-    }, 600);
+    currentExp = exp;
+    stat.textContent = "已提交，等待实时事件…";
+    await refreshList();
+    subscribeExperiment(exp.id);
   } catch (e) { stat.textContent = "创建失败：" + e.message; }
 }
 
@@ -118,6 +157,7 @@ async function init() {
   el("addGroup").onclick = () => addGroupRow();
   el("createExp").onclick = createExp;
   el("metricSel").onchange = renderChart;
+  window.addEventListener("beforeunload", () => expStream && expStream.close());
   addGroupRow("基线", "{}");
   addGroupRow("干预", "{}");
   await fillSceneSelect(el("expScene"));

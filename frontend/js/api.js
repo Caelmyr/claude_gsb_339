@@ -36,10 +36,12 @@ function fmt(v, digits = 2) {
 }
 
 function statusBadge(status) {
-  const cls = { ready: "ready", running: "running", paused: "paused",
+  const cls = { ready: "ready", running: "running", stopping: "running",
+                paused: "paused",
                 finished: "finished", stopped: "stopped", error: "error",
                 pending: "ready" }[status] || "ready";
-  const label = { ready: "就绪", running: "运行中", paused: "已暂停",
+  const label = { ready: "就绪", running: "运行中", stopping: "正在停止",
+                  paused: "已暂停",
                   finished: "已完成", stopped: "已停止", error: "错误",
                   pending: "等待中" }[status] || status;
   return `<span class="badge ${cls}">${label}</span>`;
