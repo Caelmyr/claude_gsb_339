@@ -2,6 +2,13 @@
 
 let hist = { scenes: [], runs: [], experiments: [] };
 let tab = "scenes";
+let sub = null;
+
+/* List mutations arrive as global push frames; coalesce the REST refetch so a
+ * burst of progress/status frames causes at most one list re-render. The
+ * /api/history response is always the source of truth, so a redelivered frame
+ * can never duplicate or reorder an entry. */
+const reloadThrottled = frameThrottle(() => load(), 800);
 
 function renderScenes() {
   return hist.scenes.map((s) => `
@@ -73,7 +80,35 @@ function init() {
       render();
     };
   });
+
+  // Global-scope stream: this page lists every run/experiment, so it cares
+  // about lifecycle frames regardless of which run they belong to.
+  sub = subscribeRealtime({
+    global: () => true,
+    onStatus: (d) => {
+      // Patch in place for instant badge/step feedback, then let the throttled
+      // authoritative refetch fix ordering by updated_at.
+      const r = hist.runs.find((x) => x.id === d.run_id);
+      if (r) {
+        r.status = d.status;
+        r.current_step = d.current_step;
+        render();
+      }
+      reloadThrottled();
+    },
+    onRunCreated: () => reloadThrottled(),
+    onRunDeleted: () => load(),
+    onExperiment: (d) => {
+      const e = hist.experiments.find((x) => x.id === d.experiment_id);
+      if (e) { e.status = d.status; render(); }
+      reloadThrottled();
+    },
+    onResync: () => load(),
+  });
+
   load().catch((e) => console.error(e));
 }
+
+window.addEventListener("beforeunload", () => sub && sub.close());
 
 init();

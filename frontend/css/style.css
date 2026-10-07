@@ -228,3 +228,22 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 
 /* timeline slider */
 .timeline { width: 100%; margin: 12px 0; accent-color: var(--accent); }
+
+/* real-time connection indicator */
+.rt-pill {
+  position: fixed;
+  right: 14px;
+  bottom: 12px;
+  z-index: 100;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--muted);
+  background: rgba(22, 29, 38, 0.92);
+  border: 1px solid var(--border);
+  pointer-events: none;
+  transition: color .2s, border-color .2s;
+}
+.rt-pill.live { color: var(--green); border-color: #23503a; }
+.rt-pill.reconnecting { color: var(--orange); border-color: #5b4a1f; }

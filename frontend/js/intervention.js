@@ -1,8 +1,16 @@
-/* Interventions: apply policy/drug/cull actions to a running scene + log. */
+/* Interventions: apply policy/drug/cull actions and watch the live event log.
+ *
+ * The event log updates itself over the push channel: a background batch that
+ * crosses a scheduled intervention's at_step emits run.event immediately, and
+ * manual applies from this page arrive the same way (the POST response is only
+ * used for the alert). Scheduled-intervention badges and the status line are
+ * driven by run.status / run.event too, so no polling is needed.
+ */
 
 let CATALOG = null;
 let runId = null;
 let runMeta = null;
+let sub = null;
 
 function paramField(p) {
   if (p.type === "bool") {
@@ -39,7 +47,10 @@ function renderForms() {
       try {
         const res = await post(`/api/runs/${runId}/interventions`, { type: card.dataset.type, params });
         alert(res.applied ? ("已施加：" + res.reason) : ("未施加：" + res.reason));
-        await loadAll();
+        // The authoritative event comes back over run.event; refresh scheduled
+        // badges directly as well so the click feels instant.
+        runMeta = await get(`/api/runs/${runId}`);
+        renderScheduled();
       } catch (e) { alert("施加失败：" + e.message); }
     };
   });
@@ -63,9 +74,13 @@ async function loadEvents() {
       <td class="muted small">${esc((e.result && e.result.reason) || "")}</td></tr>`).join("") + "</tbody>";
 }
 
+function renderInfo() {
+  el("runInfo").textContent = `${runMeta.name} · ${DOMAIN_LABEL[runMeta.domain]} · ${MODEL_LABEL[runMeta.model]} · 第 ${runMeta.current_step} 步 · ${runMeta.status}`;
+}
+
 async function loadAll() {
   runMeta = await get(`/api/runs/${runId}`);
-  el("runInfo").textContent = `${runMeta.name} · ${DOMAIN_LABEL[runMeta.domain]} · ${MODEL_LABEL[runMeta.model]} · 第 ${runMeta.current_step} 步 · ${runMeta.status}`;
+  renderInfo();
   renderForms();
   renderScheduled();
   await loadEvents();
@@ -74,14 +89,41 @@ async function loadAll() {
 async function init() {
   const { domains } = await get("/api/catalog");
   CATALOG = domains;
-  el("runSelect").onchange = (e) => { if (e.target.value) { runId = e.target.value; loadAll(); } };
+  el("runSelect").onchange = (e) => {
+    if (e.target.value) { runId = e.target.value; loadAll(); sub.setRunIds([runId]); }
+  };
   el("refreshBtn").onclick = async () => { await fillRunSelect(el("runSelect")); };
+
+  sub = subscribeRealtime({
+    runIds: () => (runId ? [runId] : []),
+    // An intervention (manual here, or scheduled by a running batch) happened.
+    // The log is rebuilt from the authoritative REST list, so a frame
+    // redelivered across reconnect can never duplicate a row.
+    onEvent: (d) => {
+      if (!runId || d.run_id !== runId) return;
+      loadEvents();
+      // Scheduled applies also flip "待触发" badges and advance the step.
+      get(`/api/runs/${runId}`).then((m) => { runMeta = m; renderInfo(); renderScheduled(); });
+    },
+    onStatus: (d) => {
+      if (!runId || d.run_id !== runId || !runMeta) return;
+      runMeta.status = d.status;
+      runMeta.current_step = d.current_step;
+      renderInfo();
+      if (["finished", "stopped", "error"].includes(d.status)) { loadEvents(); renderScheduled(); }
+    },
+    onResync: () => { if (runId) loadAll(); },
+  });
+
   await fillRunSelect(el("runSelect"));
   if (el("runSelect").options.length > 1) {
     el("runSelect").selectedIndex = 1;
     runId = el("runSelect").value;
     await loadAll();
+    sub.setRunIds([runId]);
   }
 }
+
+window.addEventListener("beforeunload", () => sub && sub.close());
 
 init().catch((e) => console.error(e));

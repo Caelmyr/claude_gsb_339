@@ -3,6 +3,8 @@
 let chart = null;
 let currentExp = null;
 let labels = {};
+let sub = null;
+let pollFallback = null;
 
 function addGroupRow(name = "", cfg = "{}") {
   const div = document.createElement("div");
@@ -48,13 +50,17 @@ async function selectExp(id) {
   currentExp = await get(`/api/experiments/${id}`);
   if (currentExp.status !== "finished") {
     el("chartCard").style.display = "none";
-    setTimeout(() => selectExp(id), 800);
     return;
   }
-  el("chartCard").style.display = "block";
-  el("chartTitle").textContent = currentExp.name;
+  renderFinished(currentExp);
+}
 
-  const keys = [...new Set(currentExp.runs.flatMap((r) =>
+function renderFinished(exp) {
+  currentExp = exp;
+  el("chartCard").style.display = "block";
+  el("chartTitle").textContent = exp.name;
+
+  const keys = [...new Set(exp.runs.flatMap((r) =>
     r.series.length ? Object.keys(r.series[0]).filter((k) => k !== "step") : []))];
   el("metricSel").innerHTML = keys.map((k) => `<option value="${esc(k)}">${esc(labels[k] || k)}</option>`).join("");
   renderChart();
@@ -101,12 +107,11 @@ async function createExp() {
   stat.textContent = "正在运行…";
   try {
     const exp = await post("/api/experiments", { name, scene_id, steps, groups });
+    stat.dataset.expId = exp.id;
     stat.textContent = "已提交，正在后台运行各组…";
-    const poll = setInterval(async () => {
-      const e = await get(`/api/experiments/${exp.id}`);
-      if (e.status === "finished") { clearInterval(poll); stat.textContent = "完成 ✓"; await refreshList(); selectExp(exp.id); }
-      else if (e.status === "error") { clearInterval(poll); stat.textContent = "出错：" + e.error; }
-    }, 600);
+    // Progress now arrives via experiment.status push; the list refreshes on
+    // each group completion and the chart renders on the finished frame. No
+    // per-experiment polling interval is started.
   } catch (e) { stat.textContent = "创建失败：" + e.message; }
 }
 
@@ -122,8 +127,40 @@ async function init() {
   addGroupRow("干预", "{}");
   await fillSceneSelect(el("expScene"));
   await refreshList();
+
+  // Global scope: experiments are not "runs", and this one stream also lets
+  // the list reflect every group's run lifecycle without per-item polling.
+  sub = subscribeRealtime({
+    global: () => true,
+    onExperiment: async (d) => {
+      const done = d.finished_groups != null ? `${d.finished_groups}/${d.total_groups}` : "";
+      const stat = el("expStatus");
+      if (stat.dataset.expId === d.experiment_id) {
+        if (d.status === "running") stat.textContent = `后台运行中… ${done}`;
+        else if (d.status === "finished") stat.textContent = "完成 ✓";
+        else if (d.status === "error") stat.textContent = "出错：" + (d.error || "");
+      }
+      if (d.status === "running") {
+        // A group finished: refresh the list badge (cheap), throttled in case
+        // frames for several groups arrive close together.
+        listRefreshThrottled();
+      } else {
+        await refreshList();
+        if (d.status === "finished" && currentExp && currentExp.id === d.experiment_id) {
+          const full = await get(`/api/experiments/${d.experiment_id}`);
+          renderFinished(full);
+        } else if (d.status === "finished" && stat.dataset.expId === d.experiment_id) {
+          selectExp(d.experiment_id);
+        }
+      }
+    },
+    onResync: async () => { await refreshList(); if (currentExp) selectExp(currentExp.id); },
+  });
 }
 
+const listRefreshThrottled = frameThrottle(() => refreshList(), 1000);
+
 window.addEventListener("resize", () => chart && chart.resize());
+window.addEventListener("beforeunload", () => sub && sub.close());
 
 init().catch((e) => console.error(e));

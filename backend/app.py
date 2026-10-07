@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
-from . import catalog, export, models, report, storage, util
+from . import catalog, export, models, realtime, report, storage, util
 from .run_manager import manager
 
 FRONTEND_DIR = os.path.join(
@@ -56,6 +56,56 @@ def create_app() -> Flask:
     @app.route("/api/health")
     def health():
         return jsonify({"status": "ok"})
+
+    # ------------------------------------------------------------------ #
+    # Real-time push (Server-Sent Events)
+    # ------------------------------------------------------------------ #
+    @app.route("/api/stream")
+    def stream():
+        """One long-lived SSE stream per browser tab.
+
+        Subscription scope — independent per connection, so two pages (or two
+        tabs) never receive each other's messages:
+
+        * ``?run=<id>&run=<id>``  subscribe to specific runs (repeatable);
+        * ``?global=1``           receive every run + experiment event
+                                  (overview / compare pages).
+
+        Reconnects resume by sequence: browsers resend the last handled ``id``
+        as the ``Last-Event-ID`` header (also accepted as ``?since=``).  When
+        the gap is older than the replay window the first frame is
+        ``hello`` with ``reason=resync`` and the client replaces its view with
+        a fresh REST fetch.
+        """
+        run_ids: Set[str] = set(request.args.getlist("run"))
+        global_scope = request.args.get("global") in ("1", "true", "yes")
+        if not run_ids and not global_scope:
+            return _err(ValueError("stream 需要 run 或 global=1 订阅参数"), 400)
+
+        since = 0
+        raw = request.args.get("since") or request.headers.get("Last-Event-ID")
+        if raw:
+            try:
+                since = max(0, int(raw))
+            except (TypeError, ValueError):
+                since = 0
+
+        sub = realtime.broker.subscribe(
+            run_ids=run_ids, global_scope=global_scope, since=since)
+
+        def generate():
+            try:
+                yield from realtime.stream(sub)
+            finally:
+                # Runs when the client goes away (GeneratorExit on disconnect).
+                realtime.broker.unsubscribe(sub)
+
+        resp = Response(generate(), mimetype="text/event-stream")
+        # SSE must not be buffered by intermediary caches / compression layers.
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["X-Accel-Buffering"] = "no"
+        resp.headers["Connection"] = "keep-alive"
+        return resp
 
     @app.route("/api/catalog")
     def get_catalog():
@@ -169,8 +219,15 @@ def create_app() -> Flask:
         def worker():
             try:
                 manager.run_batch(run_id, steps, interval, keep_engine=True)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # The request thread has already returned; surface the failure
+                # on the push channel instead of swallowing it silently.
+                meta = storage.load_run_meta(run_id)
+                if meta is not None:
+                    meta["status"] = "error"
+                    meta["error"] = str(exc)
+                    storage.save_run_meta(meta)
+                    realtime.emit_run_status(meta)
 
         if background:
             threading.Thread(target=worker, daemon=True).start()
@@ -273,15 +330,26 @@ def create_app() -> Flask:
                         s, name=s.name,
                         seed=int(cfg.get("seed", 0)),
                         snapshot_interval=max(1, steps // 50))
+                    realtime.emit_experiment_status(exp.id, "running", extra={
+                        "name": exp.name, "finished_groups": len(exp.run_ids),
+                        "total_groups": len(groups), "current_run_id": meta["id"]})
                     manager.run_batch(meta["id"], steps, keep_engine=False)
                     exp.run_ids.append(meta["id"])
                     storage.save_experiment(exp.to_dict())
+                    realtime.emit_experiment_status(exp.id, "running", extra={
+                        "name": exp.name, "finished_groups": len(exp.run_ids),
+                        "total_groups": len(groups)})
                 exp.status = "finished"
                 storage.save_experiment(exp.to_dict())
+                realtime.emit_experiment_status(exp.id, "finished", extra={
+                    "name": exp.name, "finished_groups": len(exp.run_ids),
+                    "total_groups": len(groups)})
             except Exception as exc:  # noqa: BLE001
                 exp.status = "error"
                 exp.error = str(exc)
                 storage.save_experiment(exp.to_dict())
+                realtime.emit_experiment_status(exp.id, "error", extra={
+                    "name": exp.name, "error": str(exc)})
 
         threading.Thread(target=worker, daemon=True).start()
         return jsonify(exp.to_dict()), 201

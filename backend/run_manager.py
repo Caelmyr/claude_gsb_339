@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, List, Optional
 
-from . import models, storage, util
+from . import models, realtime, storage, util
 from .engine import make_engine
 from .engine.base import Engine
 
@@ -83,16 +83,21 @@ class RunManager:
         storage.save_run_meta(meta)
         with self._lock:
             self._engines[run_id] = engine
+        realtime.emit_run_created(meta)
         return meta
 
     # ------------------------------------------------------------------ #
     # Stepping
     # ------------------------------------------------------------------ #
     def _apply_due(self, run_id: str, engine: Engine,
-                   meta: Dict[str, Any], step: int) -> None:
-        """Apply any scheduled intervention whose ``at_step`` has been reached."""
+                   meta: Dict[str, Any], step: int) -> List[Dict[str, Any]]:
+        """Apply any scheduled intervention whose ``at_step`` has been reached.
+
+        Returns the intervention events newly applied on this call so the
+        caller can persist them once and push each one to subscribers.
+        """
         events = storage.load_events(run_id)
-        changed = False
+        before = len(events)
         for itv in meta["interventions"]:
             if itv.get("applied"):
                 continue
@@ -102,10 +107,12 @@ class RunManager:
                 events.append({"step": step, "type": itv["type"],
                                "params": itv.get("params", {}),
                                "scheduled": True, "result": result})
-                changed = True
-        if changed:
+        if len(events) > before:
             storage.save_events(run_id, events)
             storage.save_run_meta(meta)
+            for ev in events[before:]:
+                realtime.emit_run_event(run_id, ev)
+        return events[before:]
 
     def step(self, run_id: str, n: int = 1) -> Dict[str, Any]:
         """Advance ``n`` steps and return the current snapshot + stats."""
@@ -125,6 +132,10 @@ class RunManager:
                 if engine.step_count % meta["snapshot_interval"] == 0:
                     storage.save_step(run_id, engine.step_count, engine.snapshot())
             storage.save_run_meta(meta)
+            # Low-frequency interactive stepping: publish the frame directly so
+            # other pages (stats, replay) tracking this run update at once.
+            realtime.emit_progress(run_id, engine.step_count,
+                                   meta.get("total_steps", 0), engine.stats())
             return {"step": engine.step_count, "stats": engine.stats(),
                     "snapshot": engine.snapshot()}
 
@@ -144,7 +155,10 @@ class RunManager:
             if snapshot_interval is not None:
                 meta["snapshot_interval"] = max(1, int(snapshot_interval))
             meta["status"] = "running"
+            meta["total_steps"] = int(meta.get("current_step", 0)) + int(steps)
+            meta["updated_at"] = util.now_iso()
             storage.save_run_meta(meta)
+            realtime.emit_run_status(meta)
 
             series = storage.load_series(run_id)
             self._abort.discard(run_id)
@@ -155,6 +169,10 @@ class RunManager:
                 engine.step()
                 meta["current_step"] = engine.step_count
                 series.append({"step": engine.step_count, **engine.stats()})
+                # High-frequency frame: coalesced by the broker to ~10 fps, so
+                # a 10k-step batch costs ~10 messages/sec, not one per step.
+                realtime.emit_progress(run_id, engine.step_count,
+                                       meta["total_steps"], engine.stats())
                 if engine.step_count % meta["snapshot_interval"] == 0:
                     storage.save_step(run_id, engine.step_count, engine.snapshot())
                 if engine.step_count % 50 == 0:
@@ -167,6 +185,12 @@ class RunManager:
             storage.save_series(run_id, series)
             storage.save_run_meta(meta)
             self._abort.discard(run_id)
+
+            # publish() drains coalesced progress under the same ordering lock,
+            # so the terminal status is always sequenced after the last frame.
+            realtime.emit_progress(run_id, engine.step_count,
+                                   meta["total_steps"], engine.stats())
+            realtime.emit_run_status(meta)
 
             final = engine.snapshot()
             if not keep_engine:
@@ -184,6 +208,7 @@ class RunManager:
             meta["status"] = "paused"
             meta["updated_at"] = util.now_iso()
             storage.save_run_meta(meta)
+            realtime.emit_run_status(meta)
             return meta
 
     def resume(self, run_id: str) -> Dict[str, Any]:
@@ -192,6 +217,7 @@ class RunManager:
             meta["status"] = "ready"
             meta["updated_at"] = util.now_iso()
             storage.save_run_meta(meta)
+            realtime.emit_run_status(meta)
             return meta
 
     def stop(self, run_id: str) -> Dict[str, Any]:
@@ -202,6 +228,7 @@ class RunManager:
             meta["status"] = "stopped"
             meta["updated_at"] = util.now_iso()
             storage.save_run_meta(meta)
+            realtime.emit_run_status(meta)
             return meta
 
     def reset(self, run_id: str) -> Dict[str, Any]:
@@ -215,12 +242,15 @@ class RunManager:
             for itv in meta["interventions"]:
                 itv["applied"] = False
             meta["current_step"] = 0
+            meta["total_steps"] = 0
             meta["status"] = "ready"
             meta["updated_at"] = util.now_iso()
             storage.save_step(run_id, 0, engine.snapshot())
             storage.save_series(run_id, [{"step": 0, **engine.stats()}])
             storage.save_events(run_id, [])
             storage.save_run_meta(meta)
+            realtime.emit_progress(run_id, 0, 0, engine.stats())
+            realtime.emit_run_status(meta)
             return meta
 
     def delete_run(self, run_id: str) -> bool:
@@ -229,7 +259,10 @@ class RunManager:
                 self._engines.pop(run_id, None)
                 self._locks.pop(run_id, None)
                 self._abort.discard(run_id)
-            return storage.delete_run(run_id)
+            deleted = storage.delete_run(run_id)
+            if deleted:
+                realtime.emit_run_deleted(run_id)
+            return deleted
 
     # ------------------------------------------------------------------ #
     # Interventions
@@ -242,12 +275,14 @@ class RunManager:
                 raise RuntimeError("该运行未载入内存，请重开新运行")
             result = engine.apply_intervention(itv)
             events = storage.load_events(run_id)
-            events.append({"step": engine.step_count, "type": itv["type"],
-                           "params": itv.get("params", {}),
-                           "scheduled": False, "result": result})
+            event = {"step": engine.step_count, "type": itv["type"],
+                     "params": itv.get("params", {}),
+                     "scheduled": False, "result": result}
+            events.append(event)
             storage.save_events(run_id, events)
             meta["updated_at"] = util.now_iso()
             storage.save_run_meta(meta)
+            realtime.emit_run_event(run_id, event)
             return result
 
     # ------------------------------------------------------------------ #

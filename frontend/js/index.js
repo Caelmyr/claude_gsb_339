@@ -1,5 +1,7 @@
 /* Landing hub: KPIs, quick start, feature cards. */
 
+let sub = null;
+
 const CARDS = [
   { file: "config.html", icon: "🗺", title: "场景配置", desc: "选择领域与模型，配置地图与参数，安排定时干预措施。" },
   { file: "individuals.html", icon: "🚗", title: "个体管理", desc: "查看、筛选与检索车辆 / 动物 / 人等个体状态。" },
@@ -40,5 +42,18 @@ el("quickGo").addEventListener("click", async () => {
     window.location.href = `/visualize.html?run=${run.id}`;
   } catch (e) { alert("创建运行失败：" + e.message); }
 });
+
+// Keep the four KPI tiles fresh without polling: lifecycle frames refetch the
+// (small) history aggregate at a throttled rate; progress frames don't change
+// the counts and are therefore ignored.
+sub = subscribeRealtime({
+  global: () => true,
+  onStatus: frameThrottle(() => load(), 2000),
+  onRunCreated: frameThrottle(() => load(), 1000),
+  onRunDeleted: () => load(),
+  onExperiment: frameThrottle(() => load(), 1000),
+  onResync: () => load(),
+});
+window.addEventListener("beforeunload", () => sub && sub.close());
 
 load().catch((e) => showNotice(el("stats"), "加载失败：" + e.message, "error"));

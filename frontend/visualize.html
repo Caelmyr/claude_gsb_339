@@ -22,6 +22,9 @@
           <button class="btn success" id="btnStart">▶ 开始</button>
           <button class="btn" id="btnPause">⏸ 暂停</button>
           <button class="btn" id="btnStep">单步</button>
+          <button class="btn primary" id="btnBatch">批量运行</button>
+          <input id="batchSteps" type="number" value="200" min="1" style="width:80px" title="批量步数">
+          <button class="btn danger" id="btnStopBatch">停止</button>
           <button class="btn danger" id="btnReset">重置</button>
         </div>
       </div>
@@ -52,6 +55,7 @@
 
   <script src="/js/api.js"></script>
   <script src="/js/common.js"></script>
+  <script src="/js/realtime.js"></script>
   <script src="/js/render.js"></script>
   <script src="/js/visualize.js"></script>
 </body>
